@@ -1,0 +1,112 @@
+name: Render Earth 10,000 BC
+
+on:
+  workflow_dispatch:
+    inputs:
+      vertical:
+        description: "Render the 52 s vertical Shorts cut instead of the 8-minute video"
+        type: boolean
+        default: false
+      height:
+        description: "Video height (1080 = 1920x1080, 2160 = 4K). For vertical this is the width."
+        default: "1080"
+      fps:
+        description: "Frames per second"
+        default: "30"
+      shards:
+        description: "Parallel jobs (max 20 on free plans). More shards = faster, same total minutes."
+        default: "20"
+
+env:
+  TOTAL: ${{ inputs.vertical && '52' || '480' }}
+  SUFFIX: ${{ inputs.vertical && 'short' || '8min' }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          n = int("${{ inputs.shards }}")
+          print("matrix=" + json.dumps(list(range(n))))
+          PY
+
+  audio:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install
+        run: |
+          npm ci || npm install
+          pip install playwright
+          playwright install --with-deps chromium
+          mkdir -p assets
+          curl -fsSL -o assets/earth.jpg https://raw.githubusercontent.com/mrdoob/three.js/r160/examples/textures/planets/earth_atmos_2048.jpg
+          curl -fsSL -o assets/grass.jpg https://raw.githubusercontent.com/mrdoob/three.js/r160/examples/textures/terrain/grasslight-big.jpg
+      - name: Record soundtrack (real time)
+        run: python3 tools/render_audio.py --total ${{ env.TOTAL }} ${{ inputs.vertical && '--vertical' || '' }} --out audio.webm
+      - uses: actions/upload-artifact@v4
+        with: { name: audio, path: audio.webm, retention-days: 3 }
+
+  render:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        shard: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install
+        run: |
+          sudo apt-get update && sudo apt-get install -y ffmpeg
+          npm ci || npm install
+          pip install playwright
+          playwright install --with-deps chromium
+          mkdir -p assets
+          curl -fsSL -o assets/earth.jpg https://raw.githubusercontent.com/mrdoob/three.js/r160/examples/textures/planets/earth_atmos_2048.jpg
+          curl -fsSL -o assets/grass.jpg https://raw.githubusercontent.com/mrdoob/three.js/r160/examples/textures/terrain/grasslight-big.jpg
+      - name: Render frames ${{ matrix.shard }}
+        run: |
+          python3 tools/render_shard.py --shard ${{ matrix.shard }} --shards ${{ inputs.shards }} \
+            --fps ${{ inputs.fps }} --height ${{ inputs.height }} --total ${{ env.TOTAL }} \
+            ${{ inputs.vertical && '--vertical' || '' }} --out chunks
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chunk-${{ matrix.shard }}
+          path: chunks/chunk_*.mp4
+          retention-days: 3
+
+  assemble:
+    needs: [render, audio]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - uses: actions/download-artifact@v4
+        with: { pattern: chunk-*, path: chunks, merge-multiple: true }
+      - uses: actions/download-artifact@v4
+        with: { name: audio, path: . }
+      - name: Join chunks + soundtrack
+        run: bash tools/assemble.sh chunks audio.webm ${{ env.TOTAL }} Earth_10000BC_${{ env.SUFFIX }}.mp4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Earth_10000BC_${{ env.SUFFIX }}
+          path: Earth_10000BC_${{ env.SUFFIX }}.mp4
+          retention-days: 14
